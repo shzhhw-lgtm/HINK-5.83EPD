@@ -1,0 +1,72 @@
+#######################################
+# Syntax coloring map for UC8179
+#######################################
+
+# Class
+UC8179	KEYWORD1
+
+# Methods and functions
+begin	KEYWORD2
+end	KEYWORD2
+powerOn	KEYWORD2
+powerOff	KEYWORD2
+deepSleep	KEYWORD2
+waitBusy	KEYWORD2
+display	KEYWORD2
+refreshByDRF	KEYWORD2
+refreshByDSP	KEYWORD2
+maintenanceClear	KEYWORD2
+writeOldFrame	KEYWORD2
+writeNewFrame	KEYWORD2
+writeOldFrameRaw	KEYWORD2
+writeNewFrameRaw	KEYWORD2
+invalidateShadow	KEYWORD2
+copyFrameToShadow	KEYWORD2
+copyShadowToFrame	KEYWORD2
+loadImage	KEYWORD2
+setDtmStrategy	KEYWORD2
+forceTempGear	KEYWORD2
+autoTempGear	KEYWORD2
+setPartialWindow	KEYWORD2
+partialIn	KEYWORD2
+partialOut	KEYWORD2
+partialRowBytes	KEYWORD2
+partialFrameBytes	KEYWORD2
+readFLG	KEYWORD2
+readREV	KEYWORD2
+fillScreen	KEYWORD2
+clearScreen	KEYWORD2
+drawPixel	KEYWORD2
+readPixel	KEYWORD2
+drawLine	KEYWORD2
+drawFastHLine	KEYWORD2
+drawFastVLine	KEYWORD2
+drawRect	KEYWORD2
+fillRect	KEYWORD2
+drawCircle	KEYWORD2
+fillCircle	KEYWORD2
+drawBitmap	KEYWORD2
+setCursor	KEYWORD2
+setTextSize	KEYWORD2
+setTextColor	KEYWORD2
+drawChar	KEYWORD2
+setDebug	KEYWORD2
+setRefreshTimeout	KEYWORD2
+lastError	KEYWORD2
+errorText	KEYWORD2
+frameBuffer	KEYWORD2
+shadowFrame	KEYWORD2
+
+# Constants
+WIDTH	LITERAL1
+HEIGHT	LITERAL1
+ROW_BYTES	LITERAL1
+FRAME_BYTES	LITERAL1
+INK_WHITE	LITERAL1
+INK_BLACK	LITERAL1
+FLG_BUSY	LITERAL1
+FLG_POF	LITERAL1
+FLG_PON	LITERAL1
+FLG_DATA	LITERAL1
+DTM_S0_SHADOW	LITERAL1
+DTM_S1_SINGLE	LITERAL1
