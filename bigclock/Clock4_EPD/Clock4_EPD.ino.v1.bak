@@ -1,0 +1,499 @@
+﻿/*
+ * Clock4_EPD — 四屏时钟（UC8179_EPD 新库移植版）
+ * ==================================================================
+ * 与旧 Clock4 相同的硬件与调度，显示层换成 UC8179_EPD：
+ *   时十 CS=10 BUSY=2 / 时个 CS=0 BUSY=1
+ *   分十 CS=5  BUSY=8 / 分个 CS=18 BUSY=19
+ *   共享 SCK=6 SDA=7 DC=3 RST=4
+ *
+ * 刷新策略（按你的要求）：
+ *   - 质量刷新 TR7（默认）
+ *   - 快速刷新 TR4（串口 f 切换）
+ *   - 每分钟 :55 预写帧，:00 齐刷；4 片背靠背 DRF 后并行等 BUSY
+ *
+ * 串口命令（115200）：
+ *   T#### 设时间   W|SSID|密码 存 WiFi   c 深度清理
+ *   f 快刷/质量刷切换   q 质量刷(TR7)   d 状态   h 帮助
+ */
+#include <Arduino.h>
+#include <UC8179_EPD.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <esp_sntp.h>
+#include <Preferences.h>
+#include "digit_font.h"
+
+// ------------------------------------------------------------------
+// 配置
+// ------------------------------------------------------------------
+#define TZ_OFFSET_SEC     (8 * 3600)
+#define NTP_SERVER_1      "ntp.aliyun.com"
+#define NTP_SERVER_2      "ntp.tencent.com"
+#define NTP_SYNC_INTERVAL_MS (86400UL * 1000)
+#define WIFI_AP_NAME      "BigClock-Setup"
+#define USE_12H           0
+#define CLEAN_CYCLES      10
+#define REFRESH_TIMEOUT   12000  // TR7 约 2.9s，留足余量
+#define CONNECTED_PANELS  4
+#define DEFAULT_QUALITY   1      // 1=TR7 质量刷（默认），0=TR4 快刷
+#define POF_DELAY_MS      2000   // 刷新完成后延迟多久 POF；0=一直保持 PON
+
+// ------------------------------------------------------------------
+// 引脚
+// ------------------------------------------------------------------
+#define PIN_SCK  6
+#define PIN_SDA  7
+#define PIN_DC   3
+#define PIN_RST  4     // 共享 RST；若接板载 EN 改成 -1
+#define PIN_MISO PIN_SDA  // SDA 单线回读（OTP/温度/状态）
+
+//                  CS   DC       RST      BUSY
+UC8179_EPD panHT(  10, PIN_DC,  PIN_RST,   2);
+UC8179_EPD panHO(   0, PIN_DC,  PIN_RST,   1);
+UC8179_EPD panMT(   5, PIN_DC,  PIN_RST,   8);
+UC8179_EPD panMO(  18, PIN_DC,  PIN_RST,  19);
+UC8179_EPD* pans[4] = { &panHT, &panHO, &panMT, &panMO };
+const char* panName[4] = { "时十", "时个", "分十", "分个" };
+
+// ------------------------------------------------------------------
+// 状态
+// ------------------------------------------------------------------
+uint8_t  curHH = 0, curMM = 0, curSS = 0;
+uint32_t msLastSec = 0;
+bool     clockValid = false;
+bool     minuteRolled = false;
+bool     prepped = false;
+uint8_t  shown[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+uint8_t  nextTarget[4] = { 0, 0, 0, 0 };
+bool     changed[4] = { false, false, false, false };
+char     s_line[96] = { 0 };
+uint8_t  s_len = 0;
+Preferences prefs;
+WebServer apWeb(80);
+bool     configuring = false;
+bool     portalSaved = false;
+bool     qualityMode = DEFAULT_QUALITY;
+uint32_t pofAt = 0;   // 延迟 POF 的时间点（0=不计划）
+
+// ------------------------------------------------------------------
+// 显示
+// ------------------------------------------------------------------
+void schedulePof() {
+    pofAt = (POF_DELAY_MS > 0) ? (millis() + POF_DELAY_MS) : 0;
+}
+
+void servicePof() {
+    if (!pofAt) return;
+    if ((int32_t)(millis() - pofAt) < 0) return;
+    pofAt = 0;
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->powerOff();
+    Serial.println("[POF] 四片断电");
+}
+
+void targetsFor(uint8_t hh, uint8_t mm, uint8_t out[4]) {
+    uint8_t h = USE_12H ? ((hh % 12 == 0) ? 12 : hh % 12) : hh;
+    out[0] = h / 10;
+    out[1] = h % 10;
+    out[2] = mm / 10;
+    out[3] = mm % 10;
+}
+
+// 把 336x596 的字模按当前逻辑画布居中；放不下时转 90°
+void drawDigitOn(UC8179_EPD* p, uint8_t d) {
+    p->fillScreen(UC8179_WHITE);
+    const int16_t bw = DIGIT_W, bh = DIGIT_H, rb = DIGIT_ROW_BYTES;
+    const int16_t lw = p->width(), lh = p->height();
+    bool rot90 = (lh < bh);
+    int16_t dw = rot90 ? bh : bw;
+    int16_t dh = rot90 ? bw : bh;
+    int16_t x0 = (lw - dw) / 2, y0 = (lh - dh) / 2;
+    for (int16_t by = 0; by < bh; by++) {
+        const uint8_t* row = DIGITS[d] + (int32_t)by * rb;
+        for (int16_t bx = 0; bx < bw; bx++) {
+            if (!(row[bx >> 3] & (uint8_t)(0x80 >> (bx & 7)))) continue;
+            int16_t x, y;
+            if (rot90) { x = x0 + (bh - 1 - by); y = y0 + bx; }
+            else       { x = x0 + bx;            y = y0 + by; }
+            p->drawPixel(x, y, UC8179_BLACK);
+        }
+    }
+}
+
+// 设置波形档：质量 TR7 / 快速 TR4
+void applyGear() {
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        pans[i]->setWaveformGear(qualityMode ? 7 : 4);
+    }
+}
+
+// ------------------------------------------------------------------
+// 调度：:55 预写，:00 齐刷
+// ------------------------------------------------------------------
+void prepPhase() {
+    uint8_t nh = curHH, nm = (curMM + 1) % 60;
+    if (nm == 0) nh = (nh + 1) % 24;
+    uint8_t tgt[4];
+    targetsFor(nh, nm, tgt);
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        changed[i] = (tgt[i] != shown[i]);
+        if (changed[i]) nextTarget[i] = tgt[i];
+    }
+
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (!changed[i]) continue;
+        uint32_t t0 = millis();
+        drawDigitOn(pans[i], nextTarget[i]);
+        pans[i]->writeFrame();  // PON + 数据，不触发 DRF
+        Serial.printf("[prep] %s 预写 %lu ms\n", panName[i],
+                      (unsigned long)(millis() - t0));
+    }
+}
+
+void firePhase() {
+    bool any = false;
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) any |= changed[i];
+    if (!any) return;
+
+    applyGear();  // DRF 前定波形档
+
+    uint32_t t0 = millis();
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (changed[i]) pans[i]->triggerRefresh();
+    }
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (!changed[i]) continue;
+        if (!pans[i]->waitRefresh(REFRESH_TIMEOUT)) {
+            Serial.printf("[FAIL] %s 刷新超时\n", panName[i]);
+        }
+    }
+    Serial.printf("[fire] 齐刷收敛 %lu ms (%s)\n",
+                  (unsigned long)(millis() - t0),
+                  qualityMode ? "TR7" : "TR4");
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (changed[i]) shown[i] = nextTarget[i];
+    }
+    schedulePof();
+}
+
+void cleanAllPanels() {
+    Serial.printf("\n[CLEAN] 全面板清理：%d 轮黑白交替\n", CLEAN_CYCLES);
+    applyGear();
+    uint32_t t0 = millis();
+    for (uint8_t c = 0; c < CLEAN_CYCLES; c++) {
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+            pans[i]->fillScreen(UC8179_BLACK);
+            pans[i]->writeFrame();
+        }
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->triggerRefresh();
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->waitRefresh(REFRESH_TIMEOUT);
+
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+            pans[i]->fillScreen(UC8179_WHITE);
+            pans[i]->writeFrame();
+        }
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->triggerRefresh();
+        for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->waitRefresh(REFRESH_TIMEOUT);
+        Serial.printf("  轮 %u/%u 完成\n", c + 1, CLEAN_CYCLES);
+    }
+    Serial.printf("[CLEAN] 完成，共 %lu 秒\n",
+                  (unsigned long)((millis() - t0) / 1000));
+    schedulePof();
+}
+
+void forceRedraw() {
+    uint8_t tgt[4];
+    if (clockValid) targetsFor(curHH, curMM, tgt);
+    applyGear();
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (clockValid) drawDigitOn(pans[i], tgt[i]);
+        else            pans[i]->fillScreen(UC8179_WHITE);
+        pans[i]->writeFrame();
+    }
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->triggerRefresh();
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) pans[i]->waitRefresh(REFRESH_TIMEOUT);
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        if (clockValid) shown[i] = tgt[i];
+    }
+    schedulePof();
+}
+
+// ------------------------------------------------------------------
+// 软时钟与调度
+// ------------------------------------------------------------------
+void tickClock() {
+    struct tm t;
+    if (!getLocalTime(&t, 0)) {
+        // 没有系统时间（未配网）：手动 T#### 后靠 millis 走
+        if (!clockValid) return;
+        while (millis() - msLastSec >= 1000) {
+            msLastSec += 1000;
+            curSS++;
+            if (curSS >= 60) {
+                curSS = 0;
+                curMM++;
+                minuteRolled = true;
+                if (curMM >= 60) { curMM = 0; curHH = (curHH + 1) % 24; }
+            }
+        }
+        return;
+    }
+
+    uint8_t nh = t.tm_hour, nm = t.tm_min, ns = t.tm_sec;
+
+    if (!clockValid) {
+        curHH = nh; curMM = nm; curSS = ns;
+        clockValid = true;
+        Serial.printf("[TIME] 系统时间 %02d:%02d:%02d\n", curHH, curMM, curSS);
+        forceRedraw();
+        return;
+    }
+
+    // 只认“分钟变化”。SNTP 每 24h 在后台更新系统时间，
+    // 这里绝不做“漂移校正 → 强制重绘”，避免整夜反复刷新。
+    if (nh != curHH || nm != curMM) {
+        curHH = nh; curMM = nm; curSS = ns;
+        minuteRolled = true;
+    } else {
+        curSS = ns;  // :55 预写需要秒
+    }
+}
+
+void scheduler() {
+    if (configuring) return;
+    if (!clockValid) return;
+    if (!prepped && curSS >= 55) {
+        prepPhase();
+        prepped = true;
+    }
+    if (minuteRolled) {
+        minuteRolled = false;
+        if (prepped) {
+            firePhase();
+        } else {
+            // 时间跳变/错过 :55：直接按当前时间重绘一次
+            forceRedraw();
+        }
+        prepped = false;
+    }
+}
+
+// ------------------------------------------------------------------
+// WiFi / 配网
+// ------------------------------------------------------------------
+void wifiLoadAndConnect() {
+    prefs.begin("clock4", true);
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    if (ssid.length()) {
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        Serial.printf("[NTP] 连接 WiFi（%s）\n", ssid.c_str());
+    } else {
+        Serial.println("[NTP] 无凭据，开启配网热点");
+        portalStart();
+    }
+    configTime(TZ_OFFSET_SEC, 0, NTP_SERVER_1, NTP_SERVER_2);
+    // 立即生效（不做平滑 slew），之后每 24 小时才同步一次
+    sntp_set_sync_mode(SNTP_SYNC_MODE_IMMED);
+    sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS);
+}
+
+void portalStopAndConnect() {
+    portalSaved = false;
+    apWeb.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    prefs.begin("clock4", true);
+    String ssid = prefs.getString("ssid", "");
+    String pass = prefs.getString("pass", "");
+    prefs.end();
+    if (ssid.length()) WiFi.begin(ssid.c_str(), pass.c_str());
+    configuring = false;
+    Serial.printf("[WIFI] 连接 \"%s\" 中\n", ssid.c_str());
+}
+
+void portalStart() {
+    if (configuring) return;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(WIFI_AP_NAME);
+    apWeb.on("/", []() {
+        apWeb.send(200, "text/html; charset=utf-8",
+            "<meta charset='utf-8'><title>Clock4 配网</title>"
+            "<div style='font-size:20px;margin:12px'>Clock4 WiFi 配网</div>"
+            "<form action='/save' method='get' style='font-size:18px'>"
+            "WiFi名称(SSID):<br><input name='ssid' style='width:95%;height:28px;font-size:16px'><br><br>"
+            "密码:<br><input name='pass' type='password' style='width:95%;height:28px;font-size:16px'><br><br>"
+            "<input type='submit' value='保存并连接' style='font-size:18px;padding:8px 20px'>"
+            "</form>");
+    });
+    apWeb.on("/save", []() {
+        String ssid = apWeb.arg("ssid");
+        String pass = apWeb.arg("pass");
+        if (!ssid.length()) {
+            apWeb.send(200, "text/html; charset=utf-8",
+                "<meta charset='utf-8'>SSID 不能为空，<a href='/'>返回</a>");
+            return;
+        }
+        prefs.begin("clock4", false);
+        prefs.putString("ssid", ssid);
+        prefs.putString("pass", pass);
+        prefs.end();
+        portalSaved = true;
+        apWeb.send(200, "text/html; charset=utf-8",
+            "<meta charset='utf-8'>已保存，正在连接 WiFi。<a href='/'>返回</a>");
+    });
+    apWeb.onNotFound([]() {
+        apWeb.sendHeader("Location", "/");
+        apWeb.send(302, "text/plain", "");
+    });
+    apWeb.begin();
+    configuring = true;
+    Serial.printf("[WIFI] 热点 %s 已开：手机连它，浏览器打开 http://192.168.4.1\n",
+                  WIFI_AP_NAME);
+}
+
+void printStatus() {
+    Serial.printf("时间 %02d:%02d:%02d (%s) 阶段=%s 显示=%c%c%c%c 波形=%s\n",
+                  curHH, curMM, curSS, clockValid ? "有效" : "未设",
+                  prepped ? "已预写" : "空闲",
+                  shown[0] == 0xFF ? ' ' : ('0' + shown[0]),
+                  shown[1] == 0xFF ? ' ' : ('0' + shown[1]),
+                  shown[2] == 0xFF ? ' ' : ('0' + shown[2]),
+                  shown[3] == 0xFF ? ' ' : ('0' + shown[3]),
+                  qualityMode ? "TR7" : "TR4");
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        Serial.printf("  %s: 供电=%d\n", panName[i], pans[i]->isPowered() ? 1 : 0);
+    }
+    Serial.printf("  WiFi: %s | NTP: %s\n",
+                  (WiFi.status() == WL_CONNECTED) ? "已连接" : "未连接",
+                  clockValid ? "已同步" : "等待中");
+}
+
+void printHelp() {
+    Serial.println(F(
+        "\n=== Clock4 (UC8179_EPD) ===\n"
+        "  T#### 设时间   W|SSID|密码 存 WiFi   c 深度清理\n"
+        "  f 快刷(TR4)/质量刷(TR7)切换   q 质量刷   d 状态   h 帮助\n"
+        "  默认 TR7；:55 预写，:00 四屏齐刷\n"));
+}
+
+void handleLine() {
+    if (s_len >= 3 && s_line[0] == 'W' && s_line[1] == '|') {
+        char* sep = strchr(s_line + 2, '|');
+        if (!sep) { Serial.println("[WIFI] 格式：W|SSID|密码"); return; }
+        *sep = 0;
+        String ssid = String(s_line + 2);
+        String pass = String(sep + 1);
+        if (!ssid.length()) { Serial.println("[WIFI] SSID 不能为空"); return; }
+        prefs.begin("clock4", false);
+        prefs.putString("ssid", ssid);
+        prefs.putString("pass", pass);
+        prefs.end();
+        WiFi.begin(ssid.c_str(), pass.c_str());
+        Serial.printf("[WIFI] 已保存并连接 \"%s\"\n", ssid.c_str());
+        return;
+    }
+    if (s_len == 5 && (s_line[0] == 'T' || s_line[0] == 't')) {
+        uint8_t hh = 0, mm = 0, ok = 1;
+        for (uint8_t k = 0; k < 4; k++) {
+            char c = s_line[1 + k];
+            if (c < '0' || c > '9') { ok = 0; break; }
+            if (k < 2) hh = hh * 10 + (c - '0');
+            else       mm = mm * 10 + (c - '0');
+        }
+        if (ok && hh < 24 && mm < 60) {
+            curHH = hh; curMM = mm; curSS = 0;
+            msLastSec = millis();
+            clockValid = true;
+            prepped = false;
+            minuteRolled = false;
+            Serial.printf("[TIME] 手动设定 %02d:%02d\n", curHH, curMM);
+            forceRedraw();
+            return;
+        }
+        Serial.println("[TIME] 格式：T####");
+        return;
+    }
+    if (s_len == 1) {
+        switch (s_line[0]) {
+            case 'c':
+                cleanAllPanels();
+                prepped = false;
+                forceRedraw();
+                break;
+            case 'w': portalStart(); break;
+            case 'f':
+                qualityMode = !qualityMode;
+                applyGear();
+                Serial.printf("[MODE] %s\n", qualityMode ? "TR7 质量刷" : "TR4 快刷");
+                break;
+            case 'q':
+                qualityMode = true;
+                applyGear();
+                Serial.println("[MODE] TR7 质量刷");
+                break;
+            case 'd': printStatus(); break;
+            case 'h': printHelp(); break;
+        }
+    }
+}
+
+void serviceSerial() {
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\r' || c == '\n') {
+            s_line[s_len] = 0;
+            if (s_len) handleLine();
+            s_len = 0;
+            continue;
+        }
+        if (s_len < 94) s_line[s_len++] = c;
+        else s_len = 0;
+    }
+}
+
+// ------------------------------------------------------------------
+// setup / loop
+// ------------------------------------------------------------------
+void setup() {
+    Serial.begin(115200);
+    delay(400);
+    Serial.println("\nClock4 EPD — 四屏时钟");
+
+    for (uint8_t i = 0; i < CONNECTED_PANELS; i++) {
+        // 旧库 ROTATION_270 对应新库 rotation 1（不是 3）
+        pans[i]->setRotation(i < 2 ? 0 : 1);
+        pans[i]->setPowerOffAfterRefresh(false);  // POF 由 schedulePof() 延迟执行
+        bool ok = pans[i]->begin(PIN_SCK, PIN_MISO, PIN_SDA, 4000000,
+                                 i == 0 && PIN_RST >= 0);
+        if (!ok) Serial.printf("[FAIL] %s begin\n", panName[i]);
+    }
+    applyGear();
+
+    wifiLoadAndConnect();
+    printHelp();
+    forceRedraw();
+    Serial.println("串口发 W|SSID|密码 连 WiFi；或 T#### 设时间。\n");
+}
+
+void loop() {
+    servicePof();
+    serviceSerial();
+    if (configuring) {
+        apWeb.handleClient();
+        while (Serial.available()) {
+            char c = (char)Serial.read();
+            if (c == 'x' || c == 'X') { portalStopAndConnect(); return; }
+        }
+        if (portalSaved) portalStopAndConnect();
+        delay(2);
+        return;
+    }
+    tickClock();
+    scheduler();
+    delay(2);
+}
+
+
