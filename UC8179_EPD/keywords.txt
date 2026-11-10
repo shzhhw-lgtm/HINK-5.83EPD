@@ -1,0 +1,52 @@
+#######################################
+# 语法高亮关键字 (Arduino IDE)
+#######################################
+UC8179_EPD	KEYWORD1
+UC8179_BLACK	LITERAL1
+UC8179_WHITE	LITERAL1
+
+begin	KEYWORD2
+ready	KEYWORD2
+width	KEYWORD2
+height	KEYWORD2
+setRotation	KEYWORD2
+getRotation	KEYWORD2
+setMirror	KEYWORD2
+setInverted	KEYWORD2
+inverted	KEYWORD2
+buffer	KEYWORD2
+bufferSize	KEYWORD2
+setBuffer	KEYWORD2
+fillScreen	KEYWORD2
+drawPixel	KEYWORD2
+drawLine	KEYWORD2
+drawFastHLine	KEYWORD2
+drawFastVLine	KEYWORD2
+drawRect	KEYWORD2
+fillRect	KEYWORD2
+drawCircle	KEYWORD2
+fillCircle	KEYWORD2
+drawBitmap	KEYWORD2
+drawChar	KEYWORD2
+drawString	KEYWORD2
+drawStringf	KEYWORD2
+display	KEYWORD2
+startRefresh	KEYWORD2
+waitRefresh	KEYWORD2
+powerOff	KEYWORD2
+hibernate	KEYWORD2
+isBusy	KEYWORD2
+timedOut	KEYWORD2
+setSinglePlane	KEYWORD2
+singlePlane	KEYWORD2
+setRefreshMode	KEYWORD2
+refreshMode	KEYWORD2
+forceTemperature	KEYWORD2
+autoTemperature	KEYWORD2
+setVcomDc	KEYWORD2
+setBorderEnd	KEYWORD2
+hardwareReset	KEYWORD2
+softReset	KEYWORD2
+REFRESH_AUTO	LITERAL1
+REFRESH_FAST	LITERAL1
+REFRESH_QUALITY	LITERAL1
